@@ -144,6 +144,9 @@ class BrowserDecider:
         text_chars: int = 1200,
         scope: Optional[Scope] = None,
         min_confidence: float = 0.15,
+        recovery: Optional[Callable[[str, Dict[str, Any], List[Dict[str, Any]]], Optional[tuple[str, str]]]] = None,
+        action_guard: Optional[Callable[[str, "ElementRef", Dict[str, Any]], bool]] = None,
+        success_check: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> None:
         # The decider is created lazily on first use. Constructing a BrowserDecider is
         # something you do while wiring an agent together - inspecting attributes, testing
@@ -167,6 +170,9 @@ class BrowserDecider:
         # confidence. Acting on a near-coin-flip is worse than not acting, so anything under
         # this bar is refused. Set 0.0 to disable, or raise it in high-stakes flows.
         self.min_confidence = min_confidence
+        self.recovery = recovery
+        self.action_guard = action_guard
+        self.success_check = success_check
 
     @property
     def decider(self) -> Decider:
@@ -189,6 +195,11 @@ class BrowserDecider:
                     # article" is a nav link AND the thing the user asked for) from being
                     # mistaken for page furniture.
                     observation = self.scope.apply(observation, goal=goal)
+                if self.success_check and self.success_check(observation):
+                    run.steps.append(Step(number, "DONE", None, "", 1.0, 0, False, detail="success oracle"))
+                    self._emit(run.steps[-1])
+                    run.stopped = "done"
+                    return run
                 table = build_element_table(observation)
                 table.history = list(history)
                 questions = table_to_questions(table, goal)
@@ -211,18 +222,61 @@ class BrowserDecider:
                 confidence = answers.confidence("operation")
                 element: Optional[ElementRef] = None
                 target: Optional[str] = None
+                recovery_applied = False
 
-                if operation in ("CLICK", "TYPE_TEXT", "SELECT"):
+                if (
+                    self.recovery
+                    and (
+                        (observation.get("state_hash") == observation.get("previous_state_hash"))
+                        or (
+                            history
+                            and (
+                                str(history[-1].get("detail", "")).startswith("action guard:")
+                                or str(history[-1].get("detail", "")).startswith("text provider returned nothing")
+                                or str(history[-1].get("detail", "")).startswith("refused:")
+                                # A driver can reject a real, observed dropdown option
+                                # (``option ... not present``) without mutating the page.
+                                # Treat that exactly like a guard/refusal: the next
+                                # unchanged observation is a no-progress cycle and the
+                                # caller's recovery policy needs a chance to propose a
+                                # different observed option.
+                                or str(history[-1].get("detail", "")).startswith("option ")
+                            )
+                        )
+                    )
+                    and history
+                ):
+                    proposal = self.recovery(goal, observation, history)
+                    if proposal is not None:
+                        recovery_operation, recovery_target = proposal
+                        recovery_element = table.targets_for(recovery_operation).get(recovery_target)
+                        if recovery_element is None:
+                            run.stopped, run.error = "error", "recovery proposed unsupported target"
+                            return run
+                        operation = recovery_operation
+                        target = recovery_target
+                        element = ElementRef(
+                            recovery_element.index,
+                            recovery_element.label,
+                            recovery_element.role,
+                            recovery_element.handle,
+                            {**recovery_element.meta, "checked": recovery_element.checked, "options": recovery_element.options},
+                            options=list(recovery_element.options),
+                        )
+                        confidence = 1.0
+                        recovery_applied = True
+
+                if not recovery_applied and operation in ("CLICK", "TYPE_TEXT", "SELECT"):
                     question_name = f"{operation.lower()}_target"
                     if question_name in answers.raw:
                         target = answers.choice(question_name)
-                        found = table.by_index().get(target)
+                        found = table.targets_for(operation).get(target)
                         if found is None:
                             step = Step(number, operation, target, "", confidence, decision.latency_ms, False,
-                                        detail="model named an index that was not offered")
+                                        detail="model named an index that does not support this operation")
                             run.steps.append(step)
                             self._emit(step)
-                            run.stopped, run.error = "error", "hallucinated target"
+                            run.stopped, run.error = "error", "unsupported target"
                             return run
                         element = ElementRef(found.index, found.label, found.role, found.handle,
                                              {**found.meta, "checked": found.checked,
@@ -273,6 +327,21 @@ class BrowserDecider:
                         return run
                     continue
 
+                if (
+                    self.action_guard
+                    and operation in ("CLICK", "TYPE_TEXT", "SELECT")
+                    and element is not None
+                    and not self.action_guard(goal, element, observation)
+                ):
+                    step = Step(number, operation, target, element.label, confidence,
+                                decision.latency_ms, False, detail="action guard: prerequisites unmet")
+                    run.steps.append(step)
+                    self._emit(step)
+                    history.append({"action": operation, "kind": operation.lower(), "target": target,
+                                    "target_label": element.label, "text": None,
+                                    "page_changed": False, "detail": "action guard: prerequisites unmet"})
+                    continue
+
                 # Human gate: irreversible-looking actions stop here unless the caller
                 # has supplied a confirmation callback that says yes.
                 if operation in ("CLICK", "TYPE_TEXT", "SELECT") and self._looks_risky(element, goal):
@@ -297,7 +366,9 @@ class BrowserDecider:
                                               detail="refused: would untick an already-checked control"))
                         self._emit(run.steps[-1])
                         history.append({"action": operation, "kind": "click", "target": target,
-                                        "text": None, "page_changed": False})
+                                        "target_label": element.label, "text": None,
+                                        "page_changed": False,
+                                        "detail": "refused: would untick an already-checked control"})
                         continue
 
                 text: Optional[str] = None
@@ -311,10 +382,12 @@ class BrowserDecider:
                     text = self.text_provider(goal, element)  # type: ignore[arg-type]
                     if not text:
                         run.steps.append(Step(number, operation, target, element.label if element else "",
-                                              confidence, decision.latency_ms, False, detail="text provider returned nothing"))
+                                              confidence, decision.latency_ms, False, detail="text provider returned nothing; action skipped"))
                         self._emit(run.steps[-1])
-                        run.stopped, run.error = "error", "no text for TYPE_TEXT"
-                        return run
+                        history.append({"action": operation, "kind": operation.lower(), "target": target,
+                                        "target_label": element.label if element else "", "text": None,
+                                        "page_changed": False, "detail": "text provider returned nothing; action skipped"})
+                        continue
 
                 # A dropdown is two answers: which field, and which option inside it. The
                 # option matters, so fetch it here rather than letting the driver guess.
@@ -383,7 +456,12 @@ class BrowserDecider:
                 run.steps.append(step)
                 self._emit(step)
                 history.append({"action": operation, "kind": operation.lower(), "target": target,
-                                "text": text, "page_changed": result.get("page_changed")})
+                                "target_label": element.label if element else "", "text": text,
+                                "page_changed": result.get("page_changed"),
+                                # Preserve driver failures for the next cycle. In particular,
+                                # a non-mutating SELECT rejection must be visible to the
+                                # recovery policy instead of looking like a fresh action.
+                                "detail": str(result.get("detail", ""))})
             run.stopped = "max_steps"
             return run
         finally:

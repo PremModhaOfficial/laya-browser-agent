@@ -241,7 +241,7 @@ class PlaywrightDriver(_BaseDriver):
         dom_sig = self._page.evaluate(
             "() => JSON.stringify([document.visibilityState,"
             " Array.from(document.querySelectorAll('button, a, input, select, textarea'))"
-            ".filter(e => e.offsetParent !== null).length,"
+            ".filter(e => e.offsetParent !== null).map(e => [e.tagName,e.id||e.name||'',e.type||'',e.value||'',e.checked===true]),"
             " (document.body ? document.body.innerText.length : 0)])"
         )
         signature = f"{self._page.url}|{self._page.title()}|{dom_sig}"
