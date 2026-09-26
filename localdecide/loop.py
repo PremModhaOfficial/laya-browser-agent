@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from .decider import Decider
-from .page import build_element_table, table_to_questions
+from .page import TARGETED_OPERATIONS, build_element_table, drop_tried_options, table_to_questions
 from .scope import Scope
 
 
@@ -187,6 +187,22 @@ class BrowserDecider:
             run.stopped, run.error = "error", "empty goal"
             return run
         history: List[Dict[str, Any]] = []
+        # (operation, target) pairs that already failed to move things, keyed by the state
+        # they were tried from. The hash comes from the driver, so this is live for drivers
+        # that report one and stays inert for drivers that do not.
+        tried: Dict[str, set] = {}
+
+        def withdraw(op: str, tgt: Optional[str]) -> None:
+            """Withdraw an action that made no progress from this state's next question.
+
+            Refusals count. A guard that refused leaves the page exactly as it was, and the model
+            is deterministic, so leaving the option on offer means it proposes the same refused
+            action until the step budget runs out. Measured on the hard fixture: 60 identical
+            "would untick an already-checked control" refusals in one run.
+            """
+            if state_hash is not None and tgt is not None and op in TARGETED_OPERATIONS:
+                tried.setdefault(state_hash, set()).add((op, tgt))
+
         try:
             for number in range(1, self.max_steps + 1):
                 observation = driver.observe()
@@ -203,6 +219,12 @@ class BrowserDecider:
                 table = build_element_table(observation)
                 table.history = list(history)
                 questions = table_to_questions(table, goal)
+                # Withdraw whatever has already been tried from this exact state. The
+                # checkpoint answers the same question the same way every time, so without
+                # this the run repeats one action until the loop guard stops it.
+                state_hash = observation.get("state_hash")
+                if state_hash is not None and tried.get(state_hash):
+                    questions = drop_tried_options(questions, tried[state_hash])
                 decision = self.decider.decide(table.state(text_chars=self.text_chars), questions)
 
                 if not decision.ok:
@@ -247,6 +269,9 @@ class BrowserDecider:
                     and history
                 ):
                     proposal = self.recovery(goal, observation, history)
+                    if proposal is not None and tuple(proposal[:2]) in (tried.get(state_hash) or ()):
+                        # Recovery must not re-propose what this state has already refused.
+                        proposal = None
                     if proposal is not None:
                         recovery_operation, recovery_target = proposal
                         recovery_element = table.targets_for(recovery_operation).get(recovery_target)
@@ -276,7 +301,7 @@ class BrowserDecider:
                                         detail="model named an index that does not support this operation")
                             run.steps.append(step)
                             self._emit(step)
-                            run.stopped, run.error = "error", "unsupported target"
+                            run.stopped, run.error = "error", f"hallucinated target {target}"
                             return run
                         element = ElementRef(found.index, found.label, found.role, found.handle,
                                              {**found.meta, "checked": found.checked,
@@ -325,6 +350,7 @@ class BrowserDecider:
                         run.stopped, run.error = "error", (
                             f"model is not confident enough to act (last: {confidence:.2f})")
                         return run
+                    withdraw(operation, target)
                     continue
 
                 if (
@@ -340,6 +366,7 @@ class BrowserDecider:
                     history.append({"action": operation, "kind": operation.lower(), "target": target,
                                     "target_label": element.label, "text": None,
                                     "page_changed": False, "detail": "action guard: prerequisites unmet"})
+                    withdraw(operation, target)
                     continue
 
                 # Human gate: irreversible-looking actions stop here unless the caller
@@ -369,6 +396,7 @@ class BrowserDecider:
                                         "target_label": element.label, "text": None,
                                         "page_changed": False,
                                         "detail": "refused: would untick an already-checked control"})
+                        withdraw(operation, target)
                         continue
 
                 text: Optional[str] = None
@@ -387,11 +415,13 @@ class BrowserDecider:
                         history.append({"action": operation, "kind": operation.lower(), "target": target,
                                         "target_label": element.label if element else "", "text": None,
                                         "page_changed": False, "detail": "text provider returned nothing; action skipped"})
+                        withdraw(operation, target)
                         continue
 
                 # A dropdown is two answers: which field, and which option inside it. The
                 # option matters, so fetch it here rather than letting the driver guess.
                 option: Optional[str] = None
+                option_key: Optional[str] = None
                 if operation == "SELECT":
                     option_question = (f"select_option_{target}"
                                        if f"select_option_{target}" in questions else "select_option")
@@ -462,6 +492,13 @@ class BrowserDecider:
                                 # a non-mutating SELECT rejection must be visible to the
                                 # recovery policy instead of looking like a fresh action.
                                 "detail": str(result.get("detail", ""))})
+                # Remember only what made no progress. Something that moved the page is still
+                # worth offering if the page returns here; something that did not can only
+                # repeat itself, so it is withdrawn from this state's next question.
+                # ponytail: a cycle whose every edge changes the state is not covered by this;
+                # recovery and max_steps still own that case.
+                if not result.get("ok", True) or result.get("page_changed") is False:
+                    withdraw(operation, target)
             run.stopped = "max_steps"
             return run
         finally:

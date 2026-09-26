@@ -12,7 +12,7 @@ from typing import Any, Dict
 
 from localdecide import BrowserDecider, Decider, Scope, choice, goal_tokens, noul, score
 from localdecide.decider import DecisionError
-from localdecide.page import build_element_table, table_to_questions
+from localdecide.page import build_element_table, drop_tried_options, table_to_questions
 
 
 class TestScope(unittest.TestCase):
@@ -751,6 +751,57 @@ class TestGrounding(unittest.TestCase):
             {"kind": "click", "node": "n1", "label": "Log in", "role": "button"},
         ]}, goal="点击“登录”按钮。")
         self.assertTrue(scoped["actions"], "grounding must never filter everything out")
+
+
+class TestDropTriedOptions(unittest.TestCase):
+    """Withdrawing a tried option is what forces a deterministic model to choose differently.
+
+    Without this a checkpoint re-answers the same question the same way and the run repeats one
+    action until the loop guard kills it. Measured on the hard fixture: the operation head stayed
+    at SELECT 0.9683 against CLICK 0.0311 on a state whose goal said to click Continue.
+    """
+
+    def questions(self):
+        return {
+            "operation": {"type": "choice",
+                          "criteria": {"CLICK": "Click.", "SELECT": "Select.", "DONE": "Done."}},
+            "click_target": {"type": "choice", "criteria": {"1": "[1] Create", "3": "[3] Continue"}},
+            "select_target": {"type": "choice", "criteria": {"1": "[1] Environment"}},
+            "select_option": {"type": "choice",
+                              "criteria": {"1:3": "[1:3] Isolated", "1:4": "[1:4] Archive"}},
+        }
+
+    def test_losing_every_target_removes_the_operation(self):
+        pruned = drop_tried_options(self.questions(), {("SELECT", "1")})
+        self.assertNotIn("select_target", pruned)
+        self.assertNotIn("select_option", pruned, "no field to choose means no option to choose")
+        self.assertNotIn("SELECT", pruned["operation"]["criteria"])
+        self.assertIn("CLICK", pruned["operation"]["criteria"])
+
+    def test_losing_one_target_keeps_the_operation(self):
+        pruned = drop_tried_options(self.questions(), {("CLICK", "1")})
+        self.assertEqual(list(pruned["click_target"]["criteria"]), ["3"])
+        self.assertIn("CLICK", pruned["operation"]["criteria"])
+        self.assertIn("SELECT", pruned["operation"]["criteria"])
+
+    def test_a_refused_select_spends_the_whole_operation(self):
+        """A select that moved nothing spends SELECT for that state, not one dropdown.
+
+        Measured on the hard fixture: withdrawing only the field left the model walking the
+        option list one refusal at a time, ten calls and never reaching the next step.
+        """
+        pruned = drop_tried_options(self.questions(), {("SELECT", "1")})
+        self.assertNotIn("select_option", pruned)
+        self.assertNotIn("select_target", pruned)
+        self.assertNotIn("SELECT", pruned["operation"]["criteria"])
+
+    def test_untargeted_operations_always_survive(self):
+        everything = {("CLICK", "1"), ("CLICK", "3"), ("SELECT", "1")}
+        pruned = drop_tried_options(self.questions(), everything)
+        self.assertIn("DONE", pruned["operation"]["criteria"])
+        self.assertNotIn("CLICK", pruned["operation"]["criteria"], "no target left means no operation")
+        self.assertNotIn("click_target", pruned)
+        self.assertNotIn("SELECT", pruned["operation"]["criteria"])
 
 
 if __name__ == "__main__":

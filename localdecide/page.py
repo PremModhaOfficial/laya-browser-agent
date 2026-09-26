@@ -333,3 +333,52 @@ def table_to_questions(table: ElementTable, goal: str, *, operations: Optional[M
                              "rules": [TARGET_RULES, "Choose an observed option for this dropdown."]},
         }
     return questions
+
+
+def drop_tried_options(questions: Dict[str, Any], tried: Iterable[Any]) -> Dict[str, Any]:
+    """Remove options already tried from this exact state.
+
+    A pair that left the state unchanged cannot change it on a retry, and a decision model is
+    deterministic, so asking again returns the same answer forever. Taking the option out of the
+    question is the only thing that forces a different one.
+
+    A no-progress SELECT spends SELECT for that state, not merely one dropdown. The page did not
+    move, so no option of any dropdown from here can move it, and the field-only version was
+    measured walking the option list one refusal at a time instead of changing operation.
+
+    When an operation loses every target it also leaves the operation question, because an
+    operation with nothing to act on is not a choice. Untargeted operations (WAIT, DONE, BLOCKED,
+    the scrolls) are never touched.
+
+    The loop guard in `loop.py` stops a run that repeats; this keeps it moving.
+    """
+    tried = {tuple(entry) for entry in tried}
+    select_spent = any(entry[0] == "SELECT" for entry in tried)
+
+    pruned = dict(questions)
+    for operation in TARGETED_OPERATIONS:
+        name = f"{operation.lower()}_target"
+        spec = pruned.get(name)
+        if spec is None:
+            continue
+        if operation == "SELECT" and select_spent:
+            keep: Dict[str, str] = {}
+        else:
+            keep = {index: label for index, label in spec["criteria"].items()
+                    if (operation, index) not in tried}
+        if keep:
+            pruned[name] = {**spec, "criteria": keep}
+            continue
+        del pruned[name]
+        operations = pruned.get("operation")
+        if operations is not None:
+            pruned["operation"] = {
+                **operations,
+                "criteria": {key: label for key, label in operations["criteria"].items()
+                             if key != operation},
+            }
+    if "select_target" not in pruned:
+        # No dropdown field can be chosen, so no option question belongs either.
+        for name in [name for name in pruned if name.startswith("select_option")]:
+            del pruned[name]
+    return pruned
