@@ -208,23 +208,47 @@ class BrowserDecider:
             self._decider = self._decider_args[0]()
         return self._decider
 
-    def run(self, driver: Driver, goal: str) -> Run:
-        run = Run(goal=goal)
-        if not goal.strip():
-            run.stopped, run.error = "error", "empty goal"
-            return run
-        history: List[Dict[str, Any]] = []
+    def _reset(self) -> None:
+        """Clear the per-run accumulators. Called by `run`, never by `step`.
+
+        The state lives on the instance rather than in `run`'s locals for one reason: `step`
+        has to continue the same run, so it must be able to see what the previous turns
+        decided, refused and already tried. `run` resets because a new run is a new run.
+        """
+        self._history: List[Dict[str, Any]] = []
         # (operation, target) pairs that already failed to move things, keyed by the state
         # they were tried from. The hash comes from the driver, so this is live for drivers
         # that report one and stays inert for drivers that do not.
-        tried: Dict[str, set] = {}
+        self._tried: Dict[str, set] = {}
         # Semantic action hash: (operation, stable node handle, value) keyed by the state
         # hash, covering every proposal whether executed or refused. The index-keyed loop
         # guard below cannot see this: hiding filled fields renumbers the same control
         # (Submit 7 -> 6 -> 5 ...), so one destructive control looks like five actions. The
         # node handle is stable across renumbering, so these all collide. Refusals are hashed
         # too - a guard-refused Submit is the signal that the next Submit must not run.
-        attempted: Dict[str, set] = {}
+        self._attempted: Dict[str, set] = {}
+        self._number = 0
+        self._state_hash: Optional[str] = None
+
+    def run(self, driver: Driver, goal: str, *, budget: Optional[int] = None) -> Run:
+        """Drive the goal to completion, or exactly one turn when `budget` is 1.
+
+        `run`, `step` and `start` all come through here. There is deliberately no second
+        decision path: a step-driven walk and a full run execute the *same* loop body with the
+        same guards, so for the same page and the same decider they must produce the same
+        action sequence. A separate stepping implementation would be a second, worse engine,
+        and a client could drive the debugger and get behaviour the real run never has.
+        """
+        run = Run(goal=goal)
+        if not goal.strip():
+            run.stopped, run.error = "error", "empty goal"
+            return run
+        if budget is None:
+            self._reset()
+        history = self._history
+        tried = self._tried
+        attempted = self._attempted
+        max_steps = self.max_steps if budget is None else min(self.max_steps, self._number + budget)
 
         def withdraw(op: str, tgt: Optional[str],
                      element: Optional["ElementRef"] = None, value: Optional[str] = None) -> None:
@@ -282,7 +306,8 @@ class BrowserDecider:
                 attempted.setdefault(state_hash, set()).add(semantic)
 
         try:
-            for number in range(1, self.max_steps + 1):
+            for number in range(self._number + 1, max_steps + 1):
+                self._number = number
                 observation = driver.observe()
                 if self.scope is not None:
                     # The goal goes in: it is what protects a legitimate target ("Random
@@ -301,6 +326,7 @@ class BrowserDecider:
                 # checkpoint answers the same question the same way every time, so without
                 # this the run repeats one action until the loop guard stops it.
                 state_hash = observation.get("state_hash")
+                self._state_hash = state_hash
                 if state_hash is not None and tried.get(state_hash):
                     questions = drop_tried_options(questions, tried[state_hash])
                 # Conditional TYPE_TEXT offer: never offer a fill the text provider cannot
@@ -672,13 +698,44 @@ class BrowserDecider:
                 # recovery and max_steps still own that case.
                 if not result.get("ok", True) or result.get("page_changed") is False:
                     withdraw(operation, target, element, payload_of(operation, text, option))
-            run.stopped = "max_steps"
+            if budget is None:
+                run.stopped = "max_steps"
+            else:
+                # A budget-limited call that did not otherwise stop is a pause, not an end.
+                # It must not read as max_steps, or a client stepping through a healthy run
+                # would see the run "finish" while the page is still mid-task.
+                run.stopped = "stepped"
             return run
         finally:
-            try:
-                driver.close()
-            except Exception:
-                pass
+            # The driver belongs to a finished run, not to a turn. Closing it here would tear
+            # the browser down after the first `step`, leaving nothing for the next one. A
+            # budget-limited call leaves it open and the caller closes it when done.
+            if budget is None:
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+
+    def step(self, driver: Driver, goal: str) -> Run:
+        """Advance the goal by exactly one turn and return.
+
+        Same loop, same guards, same decider as `run` - it is `run` with a budget of one, not
+        a second implementation. A run stepped to completion and the same run executed in one
+        call therefore produce the same actions in the same order; that equality is the whole
+        point of having one engine, and `check_engine_parity.py` proves it.
+        """
+        if not hasattr(self, "_history"):
+            self._reset()
+        return self.run(driver, goal, budget=1)
+
+    def start(self, driver: Driver, goal: str) -> Run:
+        """Launch a run: reset the per-run state and drive from turn one.
+
+        Identical to `run`, and named separately because the tool surface exposes `start`,
+        `run` and `step` and they must not be three behaviours. Kept as a distinct method so
+        the intent is legible at the call site and so the registry can hook it later.
+        """
+        return self.run(driver, goal)
 
     def _looks_risky(self, element: Optional[ElementRef], goal: str) -> bool:
         haystack = f"{element.label if element else ''} {goal}".lower()
