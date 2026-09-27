@@ -345,8 +345,54 @@ class _PointHandle:
         if tag is None:
             from playwright.sync_api import Error as PlaywrightError
             raise PlaywrightError("fill target is not an editable element (input/textarea/contenteditable)")
+        if self._set_value_natively(tag, text):
+            return
         self.page.keyboard.press("Meta+A" if self.page.evaluate("navigator.platform.includes('Mac')") else "Control+A")
         self.page.keyboard.type(text)
+
+    def _set_value_natively(self, tag: str, text: str) -> bool:
+        """Write the value the way a framework's own setter does, then report whether it stuck.
+
+        React and Vue do not read `el.value`; they install a setter on the element's prototype and
+        update their state only when that setter runs. Typing works for them because the browser
+        fires real key events, but a bulk assignment (`el.value = x`) is silently ignored - the
+        field looks filled to the DOM and stays empty to the application. Going through the
+        prototype's own setter and dispatching `input` and `change` is what makes the value real
+        for a controlled component, and it is a single round trip instead of one per character.
+
+        This is deliberately limited to the plain text controls - input/textarea of a text-like
+        type. Chromium's segmented controls (date, time, color, range) reject a bulk setter write
+        and keep their empty value, so those fall through to keyboard typing, which drives their
+        segments the way a person does. `contentEditable` is excluded too: it has no value setter
+        at all, and typing is the only way.
+
+        Returns True only when the value is confirmed to have landed, so a control that ignores
+        the write falls back to typing rather than silently recording a fill that did not happen.
+        """
+        lowered = self.page.evaluate(
+            "([x, y]) => { const el = document.elementFromPoint(x, y);"
+            " if (!el || el.tagName.toLowerCase() !== 'input') return 'textarea';"
+            " return (el.type || 'text').toLowerCase(); }",
+            [self.x, self.y],
+        )
+        text_like = {"text", "textarea", "search", "tel", "url", "email", "password", "number", ""}
+        if lowered not in text_like:
+            return False
+        return bool(self.page.evaluate(
+            "([x, y, text]) => {"
+            " const el = document.elementFromPoint(x, y);"
+            " if (!el) return false;"
+            " const proto = el instanceof HTMLTextAreaElement"
+            "   ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+            " const setter = Object.getOwnPropertyDescriptor(proto, 'value');"
+            " if (!setter || !setter.set) return false;"
+            " el.focus();"
+            " setter.set.call(el, text);"
+            " el.dispatchEvent(new Event('input', {bubbles: true}));"
+            " el.dispatchEvent(new Event('change', {bubbles: true}));"
+            " return el.value === text; }",
+            [self.x, self.y, text],
+        ))
 
 
 class CDPDriver(_BaseDriver):
