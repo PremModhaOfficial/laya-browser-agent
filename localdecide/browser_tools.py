@@ -26,7 +26,6 @@ with the vendored checkpoint.
 
 from __future__ import annotations
 
-import json
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
@@ -118,7 +117,12 @@ class BrowserTools:
                                "refusing, not queueing", refused=True)
         self.registry.start(run.id)
         with self._lock:
-            self._sessions[run.id] = self._factory(run.id)
+            session = self._factory(run.id)
+            # Park it in the run record immediately, not lazily on first use: a client can
+            # reconnect between start and the first turn, and a resume that rebuilt a new
+            # driver would hand back a blank page and throw the run away.
+            run.data["session"] = session
+            self._sessions[run.id] = session
         return {"run_id": run.id, "status": "started", "goal": goal}
 
     def _run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -136,7 +140,7 @@ class BrowserTools:
             session = self._session(run_id)
         if goal and not session.goal:
             session.goal = goal
-        result = session.run()
+        session.run()
         return self._state_payload(session, {"run_id": run_id})
 
     def _step(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -186,14 +190,27 @@ class BrowserTools:
     # -- internals ---------------------------------------------------------
 
     def _session(self, run_id: str) -> Session:
+        """The live session for a run, rebuilt only if this process does not hold one.
+
+        A session is not reconstructible from a run id alone: it owns a browser and a page, and
+        a fresh factory call would hand back a *new* page with the run's progress thrown away.
+        So the live session is parked in the registry's run record - which is memory-only and
+        dies with the process, exactly like a browser does - and this process reuses it. The
+        run id remains the only handle a client needs, which is what "stateless at the protocol
+        level" means: a reconnect resumes the same run, it does not start a new one.
+        """
         with self._lock:
             session = self._sessions.get(run_id)
-            if session is None:
-                # A reconnect, or a run the client already started: rebuild from the registry.
-                # This is the stateless promise - the run id is enough, no cookie needed.
-                self.registry.get(run_id)  # raises KeyError on an unknown run
-                session = self._factory(run_id)
-                self._sessions[run_id] = session
+            if session is not None:
+                return session
+            record = self.registry.get(run_id)          # raises KeyError on an unknown run
+            parked = record.data.get("session")
+            if isinstance(parked, Session):
+                self._sessions[run_id] = parked
+                return parked
+            session = self._factory(run_id)
+            record.data["session"] = session
+            self._sessions[run_id] = session
             return session
 
     def _state_payload(self, session: Session, extra: Dict[str, Any]) -> Dict[str, Any]:

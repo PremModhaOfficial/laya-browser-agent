@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+from .browser_tools import TOOL_NAMES as BROWSER_TOOL_NAMES
+from .browser_tools import BrowserTools
 from .decider import Decider
 from .page import build_element_table, table_to_questions
+from .registry import RegistryFull
 
 # Protocol versions this server speaks, newest first. Per the MCP lifecycle
 # spec (2025-06-18 §Version Negotiation): if the client requests a version we
@@ -102,8 +105,19 @@ TOOLS = [
 class _Session:
     """One stdio MCP session. Loads the model lazily, answers one request at a time."""
 
-    def __init__(self) -> None:
+    def __init__(self, browser_tools: "BrowserTools | None" = None) -> None:
         self._decider: Decider | None = None
+        # The seven browser tools, when the server was given a surface. They are optional so
+        # the two decision tools keep working in a deployment that has no browser, and so the
+        # model-free check can drive the surface without a browser at all.
+        self._browser = browser_tools
+
+    @property
+    def tools(self) -> List[Dict[str, Any]]:
+        """Every tool this server exposes: the decision tools, plus the browser seven if wired."""
+        if self._browser is None:
+            return list(TOOLS)
+        return list(TOOLS) + self._browser.list_tools()
 
     def decider(self) -> Decider:
         if self._decider is None:
@@ -130,7 +144,7 @@ class _Session:
             if method == "notifications/initialized":
                 return {}  # notification: no response
             if method == "tools/list":
-                return self._ok(request_id, {"tools": TOOLS})
+                return self._ok(request_id, {"tools": self.tools})
             if method == "tools/call":
                 return self._ok(request_id, self._call_tool(message.get("params", {})))
             if method == "ping":
@@ -142,6 +156,11 @@ class _Session:
     def _call_tool(self, params: Dict[str, Any]) -> Dict[str, Any]:
         name = params.get("name", "")
         arguments = params.get("arguments", {}) or {}
+        # The browser seven are dispatched first, so a name collision can never shadow a
+        # decision tool: the two sets are disjoint by construction (start/run/step/observe/
+        # answer/state/stop vs decide/page_decide).
+        if name in BROWSER_TOOL_NAMES:
+            return self._call_browser(name, arguments)
         if name == "decide":
             decision = self.decider().decide(arguments.get("state", ""), arguments.get("questions") or {})
             if not decision.ok:
@@ -175,6 +194,28 @@ class _Session:
             return {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False, default=str)}]}
         return self._tool_error(f"unknown tool: {name!r}")
 
+    def _call_browser(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch one of the browser seven through the surface.
+
+        A refused call (the cap, an unknown run, a wrong-field answer) comes back as a tool
+        error carrying the reason, not as a transport exception: a client must be able to tell
+        "busy" from "broken", and an opaque -32603 destroys that distinction.
+        """
+        if self._browser is None:
+            return self._tool_error(f"{name}: this server was started without the browser tools")
+        try:
+            payload = self._browser.call(name, arguments)
+        except KeyError as error:            # unknown run id
+            return self._tool_error(f"{name}: {error}")
+        except RegistryFull as error:        # the cap, surfaced as a refusal
+            return self._tool_error(f"{name}: registry full ({error.active}/{error.cap}); refused")
+        if isinstance(payload, dict) and payload.get("error"):
+            text = str(payload["error"])
+            if payload.get("refused"):
+                text += " (refused, not queued)"
+            return self._tool_error(f"{name}: {text}")
+        return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}]}
+
     @staticmethod
     def _tool_error(message: str) -> Dict[str, Any]:
         return {"content": [{"type": "text", "text": message}], "isError": True}
@@ -190,9 +231,38 @@ class _Session:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def serve() -> None:
-    """Run the MCP server over stdio until stdin closes."""
-    session = _Session()
+def build_browser_tools() -> BrowserTools:
+    """A live browser surface: a real Playwright driver per run, and the real session factory.
+
+    Constructed here rather than at module import so that importing this file for its decision
+    tools opens no browser and loads no checkpoint. One driver per run is also what makes a
+    resume meaningful: the run keeps the page it was on.
+    """
+    from .drivers import PlaywrightDriver
+    from .loop import BrowserDecider
+    from .session import Session
+
+    def factory(run_id: str) -> Session:
+        return Session(loop=BrowserDecider(), driver=PlaywrightDriver(), goal="")
+
+    return BrowserTools(factory)
+
+
+def serve(with_browser: bool = True) -> None:
+    """Run the MCP server over stdio until stdin closes.
+
+    With `with_browser` the seven browser tools are exposed alongside the two decision tools,
+    which is what a client calling `tools/list` needs to see. The surface is built here rather
+    than at import so that `with_browser=False` stays a pure decision server, and so a failure
+    to construct a browser surface cannot stop the decision tools from serving.
+    """
+    browser: BrowserTools | None = None
+    if with_browser:
+        try:
+            browser = build_browser_tools()
+        except Exception:  # a browser that will not open must not blind the decision tools
+            browser = None
+    session = _Session(browser)
     for line in sys.stdin:
         line = line.strip()
         if not line:
