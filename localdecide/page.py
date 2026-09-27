@@ -347,8 +347,9 @@ def drop_tried_options(questions: Dict[str, Any], tried: Iterable[Any]) -> Dict[
     measured walking the option list one refusal at a time instead of changing operation.
 
     When an operation loses every target it also leaves the operation question, because an
-    operation with nothing to act on is not a choice. Untargeted operations (WAIT, DONE, BLOCKED,
-    the scrolls) are never touched.
+    operation with nothing to act on is not a choice. A stopping operation (DONE, BLOCKED) that
+    was refused is keyed by operation alone and leaves the operation question the same way. The
+    other untargeted operations (WAIT, the scrolls) are never touched.
 
     The loop guard in `loop.py` stops a run that repeats; this keeps it moving.
     """
@@ -381,4 +382,14 @@ def drop_tried_options(questions: Dict[str, Any], tried: Iterable[Any]) -> Dict[
         # No dropdown field can be chosen, so no option question belongs either.
         for name in [name for name in pruned if name.startswith("select_option")]:
             del pruned[name]
+    # A refused stopping operation (DONE/BLOCKED) is keyed by operation alone - no target.
+    # Remove it from the operation question, or a deterministic model re-proposes it forever.
+    spent_stops = {entry[0] for entry in tried if entry[1] is None}
+    if spent_stops and "operation" in pruned:
+        operations = pruned["operation"]
+        pruned["operation"] = {
+            **operations,
+            "criteria": {key: label for key, label in operations["criteria"].items()
+                         if key not in spent_stops},
+        }
     return pruned

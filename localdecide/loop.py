@@ -115,6 +115,10 @@ class Run:
 # but names something the harness did not offer, the step is treated as malformed.
 _HARNESS_OPERATIONS = {"CLICK", "TYPE_TEXT", "SELECT", "SCROLL_DOWN", "SCROLL_UP", "WAIT", "DONE", "BLOCKED"}
 
+# Stopping operations carry no target. A refused DONE/BLOCKED is the same proposal from the
+# same state, so it is withdrawn by operation alone - unlike a target, which needs its index.
+_STOP_OPERATIONS = ("DONE", "BLOCKED")
+
 # Safety default: operations that change the world outside the page. A confirmation
 # callback gets the last word on these, whatever the model decided.
 RISKY_HINTS = ("delete", "remove account", "pay", "purchase", "buy", "checkout", "send",
@@ -199,9 +203,17 @@ class BrowserDecider:
             is deterministic, so leaving the option on offer means it proposes the same refused
             action until the step budget runs out. Measured on the hard fixture: 60 identical
             "would untick an already-checked control" refusals in one run.
+
+            Targeted operations are keyed by (operation, target). A stopping operation (DONE,
+            BLOCKED) carries no target, so it is keyed by operation alone and a DONE the success
+            oracle refused is withdrawn exactly like any other no-progress action.
             """
-            if state_hash is not None and tgt is not None and op in TARGETED_OPERATIONS:
+            if state_hash is None:
+                return
+            if tgt is not None and op in TARGETED_OPERATIONS:
                 tried.setdefault(state_hash, set()).add((op, tgt))
+            elif op in _STOP_OPERATIONS:
+                tried.setdefault(state_hash, set()).add((op, None))
 
         try:
             for number in range(1, self.max_steps + 1):
@@ -317,6 +329,22 @@ class BrowserDecider:
                         return run
 
                 if operation == "DONE":
+                    # The model's DONE is advisory; the success oracle owns the verdict. A
+                    # success_check is already consulted at the top of each cycle, so if one is
+                    # configured and the run is still here, the oracle has just disagreed. Treat
+                    # the DONE as a no-progress action - refuse it, withdraw it for this state,
+                    # and keep going - instead of stopping on the model's say-so while the page
+                    # is not green.
+                    if self.success_check is not None and not self.success_check(observation):
+                        step = Step(number, "DONE", None, "", confidence, decision.latency_ms, False,
+                                    detail="refused: success oracle disagrees")
+                        run.steps.append(step)
+                        self._emit(step)
+                        history.append({"action": operation, "kind": "done", "target": None,
+                                        "text": None, "page_changed": False,
+                                        "detail": "refused: success oracle disagrees"})
+                        withdraw("DONE", None)
+                        continue
                     run.steps.append(Step(number, "DONE", None, "", confidence, decision.latency_ms, False))
                     self._emit(run.steps[-1])
                     run.stopped = "done"

@@ -430,6 +430,26 @@ class TestLoop(unittest.TestCase):
         self.assertEqual(summary["stopped"], "done")
         self.assertIn("median_decision_ms", summary)
 
+    def test_model_done_is_refused_when_the_success_oracle_disagrees(self):
+        """A model-chosen DONE is advisory; the success oracle owns the verdict.
+
+        When they disagree the run must continue, and DONE must be withdrawn from the next
+        question for that state so a deterministic model cannot re-propose it.
+        """
+        observation = {**self.observation(), "state_hash": "s1", "previous_state_hash": "s1"}
+        backend = _SequenceBackend([
+            {"operation": "DONE"},
+            {"operation": "CLICK", "click_target": "1"},
+        ])
+        driver = FakeDriver([observation])
+        run = BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=2,
+                             success_check=lambda observation: False).run(driver, "goal")
+        self.assertNotEqual(run.stopped, "done")
+        self.assertTrue(any(s.operation == "DONE" and "oracle" in s.detail for s in run.steps))
+        self.assertEqual(driver.executed, [("CLICK", "1", None)])
+        second_questions = backend.calls[1][1]
+        self.assertNotIn("DONE", second_questions["operation"]["criteria"])
+
 
 class _SequenceBackend:
     """Plays a fixed list of {question_name: option_key} dicts, one decision at a time.
@@ -802,6 +822,13 @@ class TestDropTriedOptions(unittest.TestCase):
         self.assertNotIn("CLICK", pruned["operation"]["criteria"], "no target left means no operation")
         self.assertNotIn("click_target", pruned)
         self.assertNotIn("SELECT", pruned["operation"]["criteria"])
+
+    def test_a_refused_stopping_operation_is_withdrawn(self):
+        """A DONE the success oracle refused is keyed by operation alone and leaves the question."""
+        pruned = drop_tried_options(self.questions(), {("DONE", None)})
+        self.assertNotIn("DONE", pruned["operation"]["criteria"])
+        self.assertIn("CLICK", pruned["operation"]["criteria"])
+        self.assertIn("SELECT", pruned["operation"]["criteria"])
 
 
 if __name__ == "__main__":
