@@ -922,5 +922,64 @@ class TestDestructiveGuard(unittest.TestCase):
         self.assertEqual(run.stopped, "needs_confirmation")
 
 
+class TestConditionalTypeTextOffer(unittest.TestCase):
+    """A field the text provider will decline is not offered as a TYPE_TEXT target.
+
+    Measured on the multifield fixture: the model spent four turns proposing the two optional
+    fields, the provider returned nothing each time, and every turn was wasted. A field the
+    provider cannot fill is not a choice, so it must not reach the question at all.
+    """
+
+    class Provider:
+        """A provider with the optional-field pre-check, like FieldTextProvider."""
+
+        def __init__(self, optional):
+            self.optional = {name.lower() for name in optional}
+
+        def fillable(self, label):
+            return not any(name in label.lower() for name in self.optional)
+
+        def __call__(self, goal, element):
+            return None if not self.fillable(element.label) else "a value"
+
+    def observation(self):
+        return {"url": "https://x", "title": "T", "text": "", "actions": [
+            {"kind": "fill", "node": "n1", "label": "Full name", "role": "text"},
+            {"kind": "fill", "node": "n2", "label": "Optional referral code", "role": "text"},
+            {"kind": "click", "node": "n3", "label": "Submit application", "role": "button"},
+        ]}
+
+    def test_an_unfillable_field_is_never_offered(self):
+        provider = self.Provider({"Optional referral code"})
+        backend = _SequenceBackend([{"operation": "TYPE_TEXT", "type_text_target": "1"}])
+        driver = FakeDriver([self.observation()])
+        BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1,
+                       text_provider=provider).run(driver, "Fill the form.")
+        offered = backend.calls[0][1]["type_text_target"]["criteria"]
+        self.assertNotIn("2", offered, "the optional field must not be offered at all")
+        self.assertIn("1", offered, "a fillable field is still offered")
+
+    def test_a_provider_without_the_precheck_is_unaffected(self):
+        """A plain callable provider keeps working: the loop must not require the method."""
+        backend = _SequenceBackend([{"operation": "TYPE_TEXT", "type_text_target": "2"}])
+        driver = FakeDriver([self.observation()])
+        BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1,
+                       text_provider=lambda goal, element: "a value").run(driver, "Fill the form.")
+        self.assertEqual(driver.executed, [("TYPE_TEXT", "2", "a value")])
+
+    def test_when_every_field_is_unfillable_type_text_leaves_the_question(self):
+        """Nothing to type means TYPE_TEXT is not a choice, exactly as for a spent operation."""
+        class AllUnfillable(self.Provider):
+            def fillable(self, label):
+                return False
+
+        backend = _SequenceBackend([{"operation": "TYPE_TEXT", "type_text_target": "1"}])
+        driver = FakeDriver([self.observation()])
+        BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1,
+                       text_provider=AllUnfillable(set())).run(driver, "Fill the form.")
+        self.assertNotIn("type_text_target", backend.calls[0][1])
+        self.assertNotIn("TYPE_TEXT", backend.calls[0][1]["operation"]["criteria"])
+
+
 if __name__ == "__main__":
     unittest.main()
