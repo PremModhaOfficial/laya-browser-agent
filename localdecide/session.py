@@ -134,7 +134,7 @@ class Session:
             run = self._run or Run(goal=self.goal)
             return {
                 "goal": run.goal,
-                "stopped": run.stopped or ("running" if self.loop._number else ""),
+                "stopped": run.stopped or ("running" if getattr(self.loop, "_number", 0) else ""),
                 "steps": len(run.steps),
                 "last": (
                     {"n": run.steps[-1].n, "operation": run.steps[-1].operation,
