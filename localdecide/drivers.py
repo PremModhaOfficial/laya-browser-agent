@@ -259,14 +259,15 @@ class PlaywrightDriver(_BaseDriver):
     def _select_by_bbox(self, box: Dict[str, int], value: str) -> bool:
         """Select an option in the <select> whose box we were given.
 
-        Driving a native dropdown by keyboard is the only approach that works without
-        inventing a CSS selector: focus the control, walk its options with the keyboard,
-        and read back `value` to confirm the choice landed. If the option is not there,
-        say so - a silent failure here would look like the model picked wrong.
+        The option list is read from the element *before* any click. Clicking a native
+        <select> opens it and can leave it on the option under the cursor, so a rejected
+        value must fail without touching the control - otherwise a wrong pick silently
+        changes the page and the run's state hash drifts. Driving the native dropdown by
+        keyboard is the only approach that works without inventing a CSS selector: focus
+        the control, walk its options, then read `value` back to confirm the choice landed.
         """
         x = box["x"] + max(1, box["width"] // 2)
         y = box["y"] + max(1, box["height"] // 2)
-        self._page.mouse.click(x, y)
         element_handle = self._page.evaluate_handle(
             "([x, y]) => document.elementFromPoint(x, y)", [x, y]
         )
@@ -276,13 +277,15 @@ class PlaywrightDriver(_BaseDriver):
         options = element.evaluate("(el) => el.tagName === 'SELECT' ? "
                                    "Array.from(el.options).map(o => ({value: o.value, label: o.textContent})) : null")
         if not options:
-            # Not a native select - a custom dropdown. Try typing the option label.
+            # Not a native select - a custom dropdown. Open it, then type the option label.
+            self._page.mouse.click(x, y)
             self._page.keyboard.type(value)
             self._page.keyboard.press("Enter")
             return True
         index = next((i for i, option in enumerate(options) if option["value"] == value), None)
         if index is None:
             return False
+        self._page.mouse.click(x, y)
         # Home, then down N times: works regardless of how the page renders the list.
         self._page.keyboard.press("Home")
         for _ in range(index):

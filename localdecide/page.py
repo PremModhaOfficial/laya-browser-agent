@@ -123,9 +123,14 @@ class ElementTable:
         return {element.index: element for element in self.elements}
 
     def targets_for(self, operation: str) -> Dict[str, Element]:
-        """Only the elements that can actually perform `operation` become its options."""
+        """Only the elements that can actually perform `operation` become its options.
+
+        A SELECT with no observed options cannot be selected, so it is not offered: the
+        model may only choose from what it can act on.
+        """
         return {element.index: element for element in self.elements
-                if operation in (element.operations or [])}
+                if operation in (element.operations or [])
+                and (operation != "SELECT" or element.options)}
 
     def state(self, *, text_chars: int = 1200, layout: str = "v3") -> Dict[str, Any]:
         """The `state` half of the request.

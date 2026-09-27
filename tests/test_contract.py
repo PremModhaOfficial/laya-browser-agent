@@ -831,5 +831,54 @@ class TestDropTriedOptions(unittest.TestCase):
         self.assertIn("SELECT", pruned["operation"]["criteria"])
 
 
+class TestSelectGrounding(unittest.TestCase):
+    """When the goal names one dropdown option, the harness grounds it against the observed
+    labels and passes that option instead of the model's index.
+
+    Measured on hard_multifield: the checkpoint picked the third option of every dropdown by
+    position - right for Release environment (Isolated), wrong for Data region, where the goal
+    named European Union and it chose Archived region.
+    """
+
+    def observation(self):
+        return {"url": "https://x", "title": "T", "text": "", "actions": [
+            {"kind": "select", "node": "n1", "label": "Data region", "role": "select",
+             "current_value": "", "options": [
+                 {"label": "United States", "value": "us"},
+                 {"label": "European Union", "value": "eu"},
+                 {"label": "Archived region", "value": "archive"},
+             ]},
+            {"kind": "click", "node": "n2", "label": "Continue", "role": "button"},
+        ]}
+
+    def test_the_goal_named_option_overrides_the_model(self):
+        backend = _SequenceBackend([{"operation": "SELECT", "select_target": "1",
+                                     "select_option": "1:3"}])
+        driver = FakeDriver([self.observation()])
+        BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1).run(
+            driver, "Select European Union in Data region, then click Continue.")
+        self.assertEqual(driver.executed, [("SELECT", "1", "eu")],
+                         "the goal names European Union; the model's Archived region must not stand")
+
+    def test_a_vague_goal_leaves_the_model_choice_alone(self):
+        backend = _SequenceBackend([{"operation": "SELECT", "select_target": "1",
+                                     "select_option": "1:3"}])
+        driver = FakeDriver([self.observation()])
+        BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1).run(
+            driver, "Handle the United States and European Union records in Data region.")
+        self.assertEqual(driver.executed, [("SELECT", "1", "archive")],
+                         "two named options is not specific enough to override the model")
+
+    def test_a_select_without_options_is_not_offered(self):
+        table = build_element_table({"url": "u", "title": "t", "text": "", "actions": [
+            {"kind": "select", "node": "n1", "label": "Empty dropdown", "role": "select",
+             "current_value": "", "options": []},
+            {"kind": "click", "node": "n2", "label": "Go", "role": "button"},
+        ]})
+        questions = table_to_questions(table, "do it")
+        self.assertNotIn("select_target", questions)
+        self.assertIn("click_target", questions)
+
+
 if __name__ == "__main__":
     unittest.main()

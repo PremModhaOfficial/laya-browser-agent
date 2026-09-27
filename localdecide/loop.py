@@ -16,6 +16,7 @@ The loop is driver-agnostic on purpose: pass any object with
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
@@ -123,6 +124,28 @@ _STOP_OPERATIONS = ("DONE", "BLOCKED")
 # callback gets the last word on these, whatever the model decided.
 RISKY_HINTS = ("delete", "remove account", "pay", "purchase", "buy", "checkout", "send",
                "submit order", "confirm transfer", "unsubscribe", "cancel subscription")
+
+
+def _goal_named_option(goal: str, options: Optional[List[Dict[str, str]]]) -> Optional[Dict[str, str]]:
+    """The observed dropdown option the goal names, when exactly one is named.
+
+    Grounding, not generation: the labels come from the page we observed, so nothing the
+    model wrote enters the decision. An option matches when its label appears in the goal
+    text, or when every word of the label appears in the goal. Only a unique match is
+    trusted - with two candidates the goal is not specific enough to override the model, so
+    the model's own choice stands.
+    """
+    haystack = (goal or "").lower()
+    words = set(re.findall(r"[a-z0-9]+", haystack))
+    matches = []
+    for option in options or []:
+        label = str(option.get("label", "") or "").strip().lower()
+        if not label:
+            continue
+        label_words = [word for word in re.findall(r"[a-z0-9]+", label) if len(word) > 2]
+        if label in haystack or (label_words and all(word in words for word in label_words)):
+            matches.append(option)
+    return matches[0] if len(matches) == 1 else None
 
 
 class BrowserDecider:
@@ -447,32 +470,45 @@ class BrowserDecider:
                         continue
 
                 # A dropdown is two answers: which field, and which option inside it. The
-                # option matters, so fetch it here rather than letting the driver guess.
+                # option matters, so fetch it here rather than letting the driver guess. When
+                # the goal names one observed option, that grounding wins: the label comes
+                # from the page, so the model's index is not trusted for it.
                 option: Optional[str] = None
                 option_key: Optional[str] = None
                 if operation == "SELECT":
+                    observed = list((element.meta.get("options") if element else None) or [])
                     option_question = (f"select_option_{target}"
                                        if f"select_option_{target}" in questions else "select_option")
-                    if option_question not in answers.raw:
+                    named = _goal_named_option(goal, observed)
+                    if named is not None:
+                        matched = named
+                    elif option_question not in answers.raw:
+                        # No observed options for this dropdown, so nothing can be selected.
+                        # Withdraw it and keep going: an empty dropdown is not fatal.
                         run.steps.append(Step(number, operation, target, element.label if element else "",
                                               confidence, decision.latency_ms, False,
-                                              detail="SELECT chosen but the page offered no dropdown options"))
+                                              detail="SELECT on a dropdown with no observed options"))
                         self._emit(run.steps[-1])
-                        run.stopped, run.error = "error", "SELECT without observable options"
-                        return run
-                    option_key = answers.choice(option_question)
-                    matched = None
-                    for candidate in (element.meta.get("options") if element else None) or []:
-                        if str(candidate.get("index")) == str(option_key):
-                            matched = candidate
-                            break
-                    if matched is None:
-                        run.steps.append(Step(number, operation, target, element.label if element else "",
-                                              confidence, decision.latency_ms, False,
-                                              detail=f"option {option_key!r} was not in the observed dropdown"))
-                        self._emit(run.steps[-1])
-                        run.stopped, run.error = "error", "hallucinated dropdown option"
-                        return run
+                        history.append({"action": operation, "kind": "select", "target": target,
+                                        "target_label": element.label if element else "", "text": None,
+                                        "page_changed": False,
+                                        "detail": "SELECT on a dropdown with no observed options"})
+                        withdraw(operation, target)
+                        continue
+                    else:
+                        option_key = answers.choice(option_question)
+                        matched = None
+                        for candidate in observed:
+                            if str(candidate.get("index")) == str(option_key):
+                                matched = candidate
+                                break
+                        if matched is None:
+                            run.steps.append(Step(number, operation, target, element.label if element else "",
+                                                  confidence, decision.latency_ms, False,
+                                                  detail=f"option {option_key!r} was not in the observed dropdown"))
+                            self._emit(run.steps[-1])
+                            run.stopped, run.error = "error", "hallucinated dropdown option"
+                            return run
                     option = str(matched.get("value") or matched.get("label") or "")
                     if not option:
                         run.steps.append(Step(number, operation, target, element.label if element else "",
@@ -481,7 +517,8 @@ class BrowserDecider:
                         self._emit(run.steps[-1])
                         run.stopped, run.error = "error", "empty dropdown option"
                         return run
-                    confidence = min(confidence, answers.confidence(option_question))
+                    if option_question in answers.raw:
+                        confidence = min(confidence, answers.confidence(option_question))
 
                 # Loop guard: same operation on the same target twice with no page change.
                 repeats = sum(1 for item in history[-2:]
