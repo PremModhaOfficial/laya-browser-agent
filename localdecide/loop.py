@@ -218,8 +218,16 @@ class BrowserDecider:
         # they were tried from. The hash comes from the driver, so this is live for drivers
         # that report one and stays inert for drivers that do not.
         tried: Dict[str, set] = {}
+        # Semantic action hash: (operation, stable node handle, value) keyed by the state
+        # hash, covering every proposal whether executed or refused. The index-keyed loop
+        # guard below cannot see this: hiding filled fields renumbers the same control
+        # (Submit 7 -> 6 -> 5 ...), so one destructive control looks like five actions. The
+        # node handle is stable across renumbering, so these all collide. Refusals are hashed
+        # too - a guard-refused Submit is the signal that the next Submit must not run.
+        attempted: Dict[str, set] = {}
 
-        def withdraw(op: str, tgt: Optional[str]) -> None:
+        def withdraw(op: str, tgt: Optional[str],
+                     element: Optional["ElementRef"] = None, value: Optional[str] = None) -> None:
             """Withdraw an action that made no progress from this state's next question.
 
             Refusals count. A guard that refused leaves the page exactly as it was, and the model
@@ -230,6 +238,11 @@ class BrowserDecider:
             Targeted operations are keyed by (operation, target). A stopping operation (DONE,
             BLOCKED) carries no target, so it is keyed by operation alone and a DONE the success
             oracle refused is withdrawn exactly like any other no-progress action.
+
+            This is also where a refusal becomes a semantic action hash. Every no-progress path
+            - a caller guard, a confidence gate, a provider that declined, a driver rejection,
+            the semantic guard itself - funnels through here, so recording the semantic key here
+            is what makes a refused action count against the next proposal of the same action.
             """
             if state_hash is None:
                 return
@@ -237,6 +250,36 @@ class BrowserDecider:
                 tried.setdefault(state_hash, set()).add((op, tgt))
             elif op in _STOP_OPERATIONS:
                 tried.setdefault(state_hash, set()).add((op, None))
+            semantic = semantic_key(op, element, value)
+            if semantic is not None:
+                attempted.setdefault(state_hash, set()).add(semantic)
+
+        def semantic_key(operation: str, element: Optional["ElementRef"], value: Optional[str]) -> Optional[tuple]:
+            """(operation, stable node handle, value), or None when there is no stable handle.
+
+            The node handle is the identity the raw observation carried for the control. The
+            model-facing index changes as filled fields hide; the handle does not, so two keys
+            that mean the same act collide here. The value is part of the key so a select of one
+            option and a select of another stay distinct.
+            """
+            if element is None or element.handle is None:
+                return None
+            return (operation, str(element.handle), value)
+
+        def payload_of(op: str, text: Optional[str], option: Optional[str]) -> Optional[str]:
+            """The string this operation sends to the driver, for the semantic key's value half."""
+            return text if op == "TYPE_TEXT" else option
+
+        def hash_only(operation: str, element: Optional["ElementRef"], value: Optional[str]) -> None:
+            """Record the semantic key for this control+operation without touching the question.
+
+            A proposal that made progress should stay offerable - the same control can be the
+            right move again from a genuinely new situation. The guard refuses a collision when
+            it happens; only the no-progress path withdraws the option outright.
+            """
+            semantic = semantic_key(operation, element, value)
+            if state_hash is not None and semantic is not None:
+                attempted.setdefault(state_hash, set()).add(semantic)
 
         try:
             for number in range(1, self.max_steps + 1):
@@ -417,7 +460,7 @@ class BrowserDecider:
                     history.append({"action": operation, "kind": operation.lower(), "target": target,
                                     "target_label": element.label, "text": None,
                                     "page_changed": False, "detail": "action guard: prerequisites unmet"})
-                    withdraw(operation, target)
+                    withdraw(operation, target, element, None)
                     continue
 
                 # Human gate: irreversible-looking actions stop here unless the caller
@@ -441,7 +484,7 @@ class BrowserDecider:
                                         "target_label": element.label if element else "", "text": None,
                                         "page_changed": False,
                                         "detail": "refused: destructive control the goal does not ask for"})
-                        withdraw(operation, target)
+                        withdraw(operation, target, element, None)
                         continue
                     if self.confirm is None or not self.confirm(f"{operation} {element.label if element else ''}", element):  # type: ignore[arg-type]
                         run.steps.append(Step(number, operation, target, element.label if element else "",
@@ -467,7 +510,7 @@ class BrowserDecider:
                                         "target_label": element.label, "text": None,
                                         "page_changed": False,
                                         "detail": "refused: would untick an already-checked control"})
-                        withdraw(operation, target)
+                        withdraw(operation, target, element, None)
                         continue
 
                 text: Optional[str] = None
@@ -486,7 +529,7 @@ class BrowserDecider:
                         history.append({"action": operation, "kind": operation.lower(), "target": target,
                                         "target_label": element.label if element else "", "text": None,
                                         "page_changed": False, "detail": "text provider returned nothing; action skipped"})
-                        withdraw(operation, target)
+                        withdraw(operation, target, element, None)
                         continue
 
                 # A dropdown is two answers: which field, and which option inside it. The
@@ -540,7 +583,30 @@ class BrowserDecider:
                     if option_question in answers.raw:
                         confidence = min(confidence, answers.confidence(option_question))
 
-                # Loop guard: same operation on the same target twice with no page change.
+                # Semantic action hash, above the index guard and below every caller guard.
+                # The question is not "was this index seen" - it is "did this control already
+                # get this operation from this state". Keyed on the node handle, so the same
+                # Submit stays the same key while filled fields hide and its index walks
+                # 7 -> 6 -> 5, and on the value, so a select of a different option is a
+                # different action. Refused proposals are hashed too, so the guard-refused
+                # Submit is the evidence the next one must not run.
+                key = semantic_key(operation, element, text if operation == "TYPE_TEXT" else option)
+                if state_hash is not None and key is not None and key in attempted.get(state_hash, ()):
+                    run.steps.append(Step(number, operation, target, element.label if element else "",
+                                          confidence, decision.latency_ms, False,
+                                          detail="semantic guard: this control already got this action from this state"))
+                    self._emit(run.steps[-1])
+                    history.append({"action": operation, "kind": operation.lower(), "target": target,
+                                    "target_label": element.label if element else "", "text": text,
+                                    "page_changed": False,
+                                    "detail": "semantic guard: this control already got this action from this state"})
+                    withdraw(operation, target, element, payload_of(operation, text, option))
+                    continue
+
+                # Loop guard (fast path): same operation on the same index twice with no page
+                # change. The semantic guard above catches what renumbering hides; this one
+                # still stops an immediate index-level repeat, and stays for drivers that
+                # report no stable node handle.
                 repeats = sum(1 for item in history[-2:]
                               if item.get("action") == operation and item.get("target") == target
                               and item.get("page_changed") is False)
@@ -550,6 +616,12 @@ class BrowserDecider:
                     self._emit(run.steps[-1])
                     run.stopped, run.error = "error", "stuck: repeated action with no page change"
                     return run
+
+                # Every proposal that reaches the driver is hashed, so the next one from this
+                # state collides whether it executed, was refused, or failed. Hashing does not
+                # withdraw the option: a control that made progress is still legitimately
+                # offerable. The no-progress path below is what withdraws it from the question.
+                hash_only(operation, element, payload_of(operation, text, option))
 
                 try:
                     # `text` doubles as the payload for SELECT (the option value): one
@@ -583,7 +655,7 @@ class BrowserDecider:
                 # ponytail: a cycle whose every edge changes the state is not covered by this;
                 # recovery and max_steps still own that case.
                 if not result.get("ok", True) or result.get("page_changed") is False:
-                    withdraw(operation, target)
+                    withdraw(operation, target, element, payload_of(operation, text, option))
             run.stopped = "max_steps"
             return run
         finally:
