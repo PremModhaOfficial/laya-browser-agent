@@ -421,8 +421,28 @@ class BrowserDecider:
                     continue
 
                 # Human gate: irreversible-looking actions stop here unless the caller
-                # has supplied a confirmation callback that says yes.
-                if operation in ("CLICK", "TYPE_TEXT", "SELECT") and self._looks_risky(element, goal):
+                # has supplied a confirmation callback that says yes. One case is not a
+                # confirmation question at all - a control that destroys state the goal never
+                # asked for. Measured on the multifield fixture: once the form was complete the
+                # model clicked "Reset progress", the page cleared every field, and the run
+                # ended with nothing filled. No "yes" makes that the right action, so it is
+                # refused and taken off this state's table instead of offered to `confirm`.
+                if operation in ("CLICK", "TYPE_TEXT", "SELECT") and (
+                    self._looks_risky(element, goal)
+                    or (operation == "CLICK" and self._destructive_unasked(element, goal))
+                ):
+                    if operation == "CLICK" and self._destructive_unasked(element, goal):
+                        step = Step(number, operation, target, element.label if element else "",
+                                    confidence, decision.latency_ms, False,
+                                    detail="refused: destructive control the goal does not ask for")
+                        run.steps.append(step)
+                        self._emit(step)
+                        history.append({"action": operation, "kind": operation.lower(), "target": target,
+                                        "target_label": element.label if element else "", "text": None,
+                                        "page_changed": False,
+                                        "detail": "refused: destructive control the goal does not ask for"})
+                        withdraw(operation, target)
+                        continue
                     if self.confirm is None or not self.confirm(f"{operation} {element.label if element else ''}", element):  # type: ignore[arg-type]
                         run.steps.append(Step(number, operation, target, element.label if element else "",
                                               confidence, decision.latency_ms, False, detail="needs confirmation"))
@@ -575,6 +595,19 @@ class BrowserDecider:
     def _looks_risky(self, element: Optional[ElementRef], goal: str) -> bool:
         haystack = f"{element.label if element else ''} {goal}".lower()
         return any(hint in haystack for hint in RISKY_HINTS)
+
+    # Controls that destroy page state. A goal may plainly ask for one ("delete my account"),
+    # in which case the hint word is in the goal text and the control is left to the caller's
+    # guards. When the goal never mentions it, running it can only undo the run's own work.
+    _DESTRUCTIVE_HINTS = ("reset", "expire", "start over", "discard", "wipe", "erase",
+                          "abort", "delete", "remove account", "unsubscribe",
+                          "clear form", "clear all", "clear progress")
+
+    def _destructive_unasked(self, element: Optional[ElementRef], goal: str) -> bool:
+        """True when the control destroys state and the goal never asks for it."""
+        label = (element.label if element else "").lower()
+        lowered = (goal or "").lower()
+        return any(hint in label and hint not in lowered for hint in self._DESTRUCTIVE_HINTS)
 
     # Words that mean "this control should end up checked". Anything else (uncheck, clear,
     # opt out, deselect, disable) means the opposite, and asked-for-unticking is honoured.

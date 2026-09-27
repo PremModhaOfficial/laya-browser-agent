@@ -880,5 +880,47 @@ class TestSelectGrounding(unittest.TestCase):
         self.assertIn("click_target", questions)
 
 
+class TestDestructiveGuard(unittest.TestCase):
+    """A control that destroys page state is refused when the goal never asks for it.
+
+    Measured on multifield: once the form was complete the model clicked "Reset progress", the
+    page cleared every field, and the run ended with nothing filled. No confirmation answer
+    makes that the right action, so it is refused rather than offered to `confirm`.
+    """
+
+    def observation(self):
+        return {"url": "https://x", "title": "T", "text": "", "actions": [
+            {"kind": "click", "node": "n1", "label": "Reset progress", "role": "button"},
+            {"kind": "click", "node": "n2", "label": "Submit application", "role": "button"},
+        ]}
+
+    def test_unasked_destructive_click_is_refused(self):
+        backend = _SequenceBackend([{"operation": "CLICK", "click_target": "1"}])
+        driver = FakeDriver([self.observation()])
+        run = BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1).run(
+            driver, "Complete the applicant profile.")
+        self.assertEqual(driver.executed, [], "an unasked Reset must never run")
+        self.assertTrue(any("destructive control" in s.detail for s in run.steps),
+                        [s.detail for s in run.steps])
+        self.assertNotEqual(run.stopped, "needs_confirmation")
+
+    def test_a_goal_that_asks_for_it_is_left_alone(self):
+        backend = _SequenceBackend([{"operation": "CLICK", "click_target": "1"}])
+        driver = FakeDriver([self.observation()])
+        BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1).run(
+            driver, "Reset progress and start over.")
+        self.assertEqual(driver.executed, [("CLICK", "1", None)])
+
+    def test_a_goal_asked_risky_click_still_uses_confirmation(self):
+        backend = _SequenceBackend([{"operation": "CLICK", "click_target": "1"}])
+        driver = FakeDriver([{"url": "u", "title": "t", "text": "", "actions": [
+            {"kind": "click", "node": "n1", "label": "Delete account", "role": "button"},
+        ]}])
+        run = BrowserDecider(decider=Decider(backend=backend, retries=0), max_steps=1).run(
+            driver, "Delete my account.")
+        self.assertEqual(driver.executed, [], "a goal-asked destructive action still stops for confirm")
+        self.assertEqual(run.stopped, "needs_confirmation")
+
+
 if __name__ == "__main__":
     unittest.main()
