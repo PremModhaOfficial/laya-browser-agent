@@ -46,20 +46,31 @@ def _tool(name: str, description: str, properties: Dict[str, Any], required: Lis
 
 RUN_ID = {"type": "string", "description": "The run id returned by start/run. The only handle to a run."}
 GOAL = {"type": "string", "description": "What the agent is trying to do, in the user's words."}
+URL = {"type": "string",
+       "description": "Optional starting URL. Without it the run opens about:blank, which is "
+                      "almost never what you want - give the page the task is about."}
+VALUES = {"type": "object",
+          "description": "Optional field->value table. Keys are field labels as they appear on the "
+                         "page. A field the table does not cover stops the run with a pending "
+                         "question instead of guessing."}
+TASK_ID = {"type": "string",
+           "description": "Optional caller-chosen id for this task, echoed back so a client can "
+                          "correlate its own bookkeeping with the run id."}
 
 TOOLS = [
     _tool("start", "Launch a browser run and return its run id immediately, without driving it. "
                    "Use this to reserve a slot, then poll state, or call run. Respects the "
                    "four-run cap: a fifth concurrent start is refused, not queued.",
-          {"goal": GOAL}, ["goal"]),
+          {"goal": GOAL, "url": URL, "values": VALUES, "task_id": TASK_ID}, ["goal"]),
     _tool("run", "Drive a run to completion. This is the default verb. Returns when the run "
                  "finishes, is stopped, or is waiting on a value it cannot know (check "
-                 "`waiting_for` and answer it).",
-          {"goal": GOAL, "run_id": {"type": "string", "description": "Continue an existing run instead of starting one."}},
-          ["goal"]),
+                 "`waiting_for` and answer it). Give `run_id` to continue a started run, or a "
+                 "`goal`/`url`/`values` to start and drive one in a single call.",
+          {"goal": GOAL, "run_id": RUN_ID, "url": URL, "values": VALUES, "task_id": TASK_ID},
+          []),
     _tool("step", "Advance a run by exactly one turn. The debugger verb: use it to watch a run "
                   "move. Produces the same actions as run, one turn at a time.",
-          {"run_id": RUN_ID, "goal": {"type": "string", "description": "Required only to start a fresh run."}},
+          {"run_id": RUN_ID, "goal": GOAL, "url": URL, "values": VALUES, "task_id": TASK_ID},
           []),
     _tool("observe", "Read the current page without deciding anything. No inference, no state change.",
           {"run_id": RUN_ID}, ["run_id"]),
@@ -84,10 +95,11 @@ class BrowserTools:
     drives this directly. The two cannot drift because there is only one implementation.
     """
 
-    def __init__(self, session_factory: Callable[[str], Session],
+    def __init__(self, session_factory: Callable[[str, Dict[str, Any]], Session],
                  registry: Optional[RunRegistry] = None) -> None:
-        # The factory takes the run id so a session can be recovered after a reconnect; that
-        # is the whole point of a stateless protocol layer.
+        # The factory takes the run id and the run's spec (url, values, task_id) so a session
+        # can be recovered after a reconnect; that is the whole point of a stateless protocol
+        # layer. The spec is what makes recovery meaningful - a rebuilt driver opens the same URL.
         self._factory = session_factory
         self.registry = registry if registry is not None else RunRegistry()
         self._sessions: Dict[str, Session] = {}
@@ -108,6 +120,7 @@ class BrowserTools:
         goal = str(arguments.get("goal", "") or "").strip()
         if not goal:
             return self._error("goal is required")
+        spec = self._spec(arguments)
         try:
             run = self.registry.create(goal)
         except RegistryFull as full:
@@ -116,14 +129,36 @@ class BrowserTools:
             return self._error(f"run registry is full ({full.active}/{full.cap} active); "
                                "refusing, not queueing", refused=True)
         self.registry.start(run.id)
+        # The spec rides on the run record so a reconnect can rebuild the same run - same URL,
+        # same values - instead of handing back a blank page.
+        run.data["spec"] = spec
         with self._lock:
-            session = self._factory(run.id)
+            session = self._factory(run.id, spec)
             # Park it in the run record immediately, not lazily on first use: a client can
             # reconnect between start and the first turn, and a resume that rebuilt a new
             # driver would hand back a blank page and throw the run away.
             run.data["session"] = session
             self._sessions[run.id] = session
-        return {"run_id": run.id, "status": "started", "goal": goal}
+        # task_id is echoed so a client can correlate its own bookkeeping; the run id is still
+        # the only handle. Without one, the run id doubles as the task id.
+        return {"run_id": run.id, "status": "started", "goal": goal,
+                "task_id": spec["task_id"] or run.id, "url": spec["url"]}
+
+    @staticmethod
+    def _spec(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """The run's starting parameters, normalised in the one place they are read.
+
+        `url` empty means about:blank (the driver's own default). `values` is coerced to a flat
+        str->str map so a client cannot smuggle a non-string into the page, and a non-mapping is
+        treated as absent rather than fatal.
+        """
+        raw = arguments.get("values")
+        values = raw if isinstance(raw, dict) else {}
+        return {
+            "url": str(arguments.get("url", "") or ""),
+            "values": {str(key): str(value) for key, value in values.items()},
+            "task_id": str(arguments.get("task_id", "") or ""),
+        }
 
     def _run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         goal = str(arguments.get("goal", "") or "").strip()
@@ -132,8 +167,8 @@ class BrowserTools:
             session = self._session(run_id)
         else:
             if not goal:
-                return self._error("goal is required")
-            started = self._start({"goal": goal})
+                return self._error("run_id or goal is required")
+            started = self._start(arguments)
             if "error" in started:
                 return started
             run_id = started["run_id"]
@@ -151,7 +186,7 @@ class BrowserTools:
             if goal and not session.goal:
                 session.goal = goal
         elif goal:
-            started = self._start({"goal": goal})
+            started = self._start(arguments)
             if "error" in started:
                 return started
             run_id = started["run_id"]
@@ -208,7 +243,7 @@ class BrowserTools:
             if isinstance(parked, Session):
                 self._sessions[run_id] = parked
                 return parked
-            session = self._factory(run_id)
+            session = self._factory(run_id, record.data.get("spec") or {})
             record.data["session"] = session
             self._sessions[run_id] = session
             return session

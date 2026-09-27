@@ -242,8 +242,12 @@ def build_browser_tools() -> BrowserTools:
     from .loop import BrowserDecider
     from .session import Session
 
-    def factory(run_id: str) -> Session:
-        return Session(loop=BrowserDecider(), driver=PlaywrightDriver(), goal="")
+    def factory(run_id: str, spec: Dict[str, Any]) -> Session:
+        # The spec's url is the starting page. A client that omits it gets about:blank, which
+        # the driver's own default also says - made explicit here so the spec is the single read.
+        return Session(loop=BrowserDecider(),
+                       driver=PlaywrightDriver(start_url=spec.get("url") or "about:blank"),
+                       goal="")
 
     return BrowserTools(factory)
 
